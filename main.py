@@ -5,12 +5,55 @@ import os
 import random
 import subprocess
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QInputDialog, QFileDialog
-from PyQt5.QtCore import Qt, QTimer,QObject
+from PyQt5.QtCore import Qt, QTimer,QObject,QEventLoop
 from qt_midi_game import MidiGame
+from midi_utils import list_midi_output_devices, pick_default_midi_out_id, open_output_or_none
+
 from PyQt5.QtCore import Qt
 from qt_tetris_game import TetrisGame
 from PyQt5.QtGui import QGuiApplication, QCursor
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton, QLabel, QFileDialog, QComboBox
+)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+# ===== MIDI 出力ユーティリティ =====
+import pygame.midi
 
+def focus_window_soft(widget):
+    """Qtだけで“できるだけ”アクティブ＆フォーカスを渡す（Z順は変えない）"""
+    if not widget: return
+    try:
+        # 最小化されていれば戻す
+        if widget.windowState() & Qt.WindowMinimized:
+            widget.setWindowState(widget.windowState() & ~Qt.WindowMinimized)
+        widget.show()  # 可視を保証（raise_はしない）
+        widget.setFocus(Qt.ActiveWindowFocusReason)
+        widget.activateWindow()  # ← 通常はこれでOK（TopMostでなくても可）
+    except Exception:
+        pass
+# どこか共通utilsに
+def bring_front_noactivate(widget):
+    widget.raise_()  # Qt側のZ順
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        SWP_NOMOVE=0x2; SWP_NOSIZE=0x1; SWP_NOACTIVATE=0x10; SWP_SHOWWINDOW=0x40
+        HWND_TOPMOST = -1
+        hwnd = int(widget.winId())
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    except Exception:
+        # 非Windowsでも安全に無視
+        pass
+
+
+
+def format_mmss(seconds: float) -> str:
+        total = max(0, int(round(seconds)))  # 四捨五入して負は0に
+        m, s = divmod(total, 60)
+        return f"{m:02d}分{s:02d}秒"
+    
 def win_force_topmost(widget, on=True):
     try:
         import ctypes, sys
@@ -41,6 +84,25 @@ def force_to_screen(widget: QWidget, screen):
         h.setScreen(screen)
     g = screen.geometry()
     widget.move(g.topLeft())
+# 既存クラス群の近くに追加
+class WhiteCoverWindow(QWidget):
+    """対象スクリーンを真っ白で覆う（最前面・全画面）"""
+    def __init__(self, screen=None, parent=None):
+        super().__init__(parent)
+        self._screen = screen
+        # 最前面・枠なし・フォーカス奪わない
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setStyleSheet("background:#ffffff;")
+
+    def show_cover(self):
+        scr = self._screen or QGuiApplication.primaryScreen()
+        g = scr.geometry()
+        self.setGeometry(g)
+        self.showFullScreen()
+        self.raise_()
+        win_force_topmost(self, True)
 
 class PreviewController(QObject):
     def __init__(self, parent=None):
@@ -153,10 +215,10 @@ class PreviewController(QObject):
                 w.set_click_through(False)   # 透過解除＋TopMost維持
         except Exception:
             pass
-        win_force_topmost(w, True)  
+        #win_force_topmost(w, True)  
         
         self._widget = None
-        win_force_topmost(w, True)
+        #win_force_topmost(w, True)
         
         if self._front_keepalive:
             try: self._front_keepalive.stop()
@@ -296,6 +358,304 @@ class PreviewController(QObject):
 
 # （他の QWidget クラス定義の近くに追加）
 
+
+from PyQt5.QtWidgets import QDialog, QListWidget, QHBoxLayout, QComboBox
+from PyQt5.QtCore import QEventLoop, QThread, pyqtSignal
+import mido
+
+class _PreviewThread(QThread):
+    finished_once = pyqtSignal()
+
+    def __init__(self, midi_path, out_id, seconds=8, parent=None):
+        super().__init__(parent)
+        self.midi_path = midi_path
+        self.out_id = out_id
+        self.seconds = seconds
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            if self.out_id == -1:
+                return
+            pygame.midi.init()
+            out = pygame.midi.Output(self.out_id)
+            start = time.time()
+            for msg in mido.MidiFile(self.midi_path).play(meta_messages=True):
+                if self._stop or (time.time() - start) > self.seconds:
+                    break
+                if msg.type in ("note_on", "note_off"):
+                    status = 0x90 if msg.type == "note_on" else 0x80
+                    note = getattr(msg, "note", 0)
+                    vel = getattr(msg, "velocity", 0)
+                    out.write_short(status, note, vel)
+            out.close()
+        except Exception:
+            pass
+        finally:
+            self.finished_once.emit()
+# ---- 追加・置き換え：試聴なしの超シンプル選曲UI ----
+from PyQt5.QtWidgets import QDialog, QListWidget, QHBoxLayout, QComboBox, QFileDialog, QVBoxLayout, QPushButton, QLabel
+from PyQt5.QtCore import Qt
+import os
+
+class SimpleSongSelectDialog(QDialog):
+    """
+    ・試聴なし
+    ・左：曲一覧（.mid/.midi）
+    ・右：難易度 / MIDI出力デバイス / 操作ボタン（OK・キャンセル・ファイル追加）
+    """
+    def __init__(self, parent=None, seed_dirs=None,
+                 list_midi_output_devices_func=None,
+                 pick_default_midi_out_id_func=None):
+        super().__init__(parent)
+        self.setWindowTitle("楽曲選択")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(720, 420)
+        self.setModal(True)
+
+        # 依存関数（外から注入：既存関数をそのまま使う）
+        self._list_midi_outs = list_midi_output_devices_func
+        self._pick_default_id = pick_default_midi_out_id_func
+
+        root = QHBoxLayout(self)
+
+        # 左：曲リスト
+        self.list = QListWidget(self)
+        self.list.itemDoubleClicked.connect(self.accept)  # ダブルクリックで確定
+        root.addWidget(self.list, 2)
+
+        # 右：コントロール
+        right = QVBoxLayout()
+        root.addLayout(right, 1)
+
+        # 難易度
+        self.diff = QComboBox(self)
+        self.diff.addItems(["Easy", "Normal", "Hard"])
+        right.addWidget(QLabel("難易度:", self))
+        right.addWidget(self.diff)
+
+        # MIDI出力デバイス選択
+        self.out_combo = QComboBox(self)
+        right.addWidget(QLabel("MIDI 出力:", self))
+        self._id_by_index = []
+        sel_index = 0
+        outs = self._list_midi_outs() if self._list_midi_outs else []
+        default_id = self._pick_default_id() if self._pick_default_id else -1
+        for idx, (pid, pname) in enumerate(outs):
+            self.out_combo.addItem(f"[{pid}] {pname}")
+            self._id_by_index.append(pid)
+            if pid == default_id:
+                sel_index = idx
+        if outs:
+            self.out_combo.setCurrentIndex(sel_index)
+        right.addWidget(self.out_combo)
+
+        # 操作ボタン
+        btn_add = QPushButton("ファイルを追加…", self)
+        btn_ok = QPushButton("決定", self)
+        btn_cancel = QPushButton("キャンセル", self)
+        for b in (btn_add, btn_ok, btn_cancel):
+            b.setMinimumHeight(40)
+        right.addWidget(btn_add)
+        right.addWidget(btn_ok)
+        right.addWidget(btn_cancel)
+        right.addStretch(1)
+
+        # 初期リスト投入
+        self._seen = set()
+        for folder in (seed_dirs or []):
+            if folder and os.path.isdir(folder):
+                for name in os.listdir(folder):
+                    if name.lower().endswith((".mid", ".midi")):
+                        self._add_path(os.path.join(folder, name))
+
+        # 結果フィールド
+        self.selected_path = None
+        self.selected_diff = "Normal"
+        self.selected_out_id = default_id
+
+        # イベント
+        btn_add.clicked.connect(self._on_add_file)
+        btn_ok.clicked.connect(self._on_ok)
+        btn_cancel.clicked.connect(self.reject)
+
+        # 最初の項目を選択状態に
+        if self.list.count() > 0:
+            self.list.setCurrentRow(0)
+
+    def _add_path(self, p):
+        if p and p not in self._seen:
+            self._seen.add(p)
+            self.list.addItem(p)
+
+    def _current_out_id(self):
+        if not self._id_by_index:
+            return -1
+        i = self.out_combo.currentIndex()
+        if 0 <= i < len(self._id_by_index):
+            return self._id_by_index[i]
+        return -1
+
+    def _on_add_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "MIDIファイルを選択", "", "MIDI Files (*.mid *.midi)"
+        )
+        if path:
+            self._add_path(path)
+            # 追加した曲を選択
+            items = self.list.findItems(path, Qt.MatchExactly)
+            if items:
+                self.list.setCurrentItem(items[0])
+
+    def _on_ok(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        self.selected_path = item.text()
+        self.selected_diff = self.diff.currentText()
+        self.selected_out_id = self._current_out_id()
+        self.accept()
+
+class SongSelectDialog(QDialog):
+    def __init__(self, parent=None, seed_dirs=None):
+        super().__init__(parent)
+        self.setWindowTitle("楽曲選択")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setMinimumSize(720, 420)
+        self.setModal(True)
+
+        # 左：曲リスト、右：操作
+        root = QHBoxLayout(self)
+
+        self.list = QListWidget(self)
+        root.addWidget(self.list, 2)
+
+        right = QVBoxLayout()
+        root.addLayout(right, 1)
+
+        # 難易度
+        self.diff = QComboBox(self); self.diff.addItems(["Easy","Normal","Hard"])
+        right.addWidget(QLabel("難易度:", self))
+        right.addWidget(self.diff)
+
+        # MIDI出力デバイス選択
+        right.addWidget(QLabel("MIDI 出力:", self))
+        self.out_combo = QComboBox(self)
+        outs = list_midi_output_devices()
+        default_id = pick_default_midi_out_id()
+        self._id_by_index = []
+        sel_index = 0
+        for idx, (pid, pname) in enumerate(outs):
+            self.out_combo.addItem(f"[{pid}] {pname}")
+            self._id_by_index.append(pid)
+            if pid == default_id:
+                sel_index = idx
+        self.out_combo.setCurrentIndex(sel_index)
+        right.addWidget(self.out_combo)
+
+        # 操作ボタン
+        btn_preview = QPushButton("試聴", self)
+        btn_ok = QPushButton("決定", self)
+        btn_cancel = QPushButton("キャンセル", self)
+        for b in (btn_preview, btn_ok, btn_cancel): b.setMinimumHeight(40)
+        right.addWidget(btn_preview)
+        right.addWidget(btn_ok)
+        right.addWidget(btn_cancel)
+        right.addStretch(1)
+
+        # 候補一覧を埋める
+        paths = []
+        for folder in (seed_dirs or []):
+            if folder and os.path.isdir(folder):
+                for name in os.listdir(folder):
+                    if name.lower().endswith((".mid",".midi")):
+                        paths.append(os.path.join(folder, name))
+        # 重複は除去
+        seen = set()
+        for p in paths:
+            if p not in seen:
+                self.list.addItem(p)
+                seen.add(p)
+
+        # フィールド
+        self.selected_path = None
+        self.selected_diff = "Normal"
+        self.selected_out_id = default_id
+        self._preview_th = None
+        self._midi_inited=False
+
+        # イベント
+        btn_preview.clicked.connect(self._on_preview)
+        btn_ok.clicked.connect(self._on_ok)
+        btn_cancel.clicked.connect(self.reject)
+
+    def _current_out_id(self):
+        if not self._id_by_index:
+            return -1
+        i = self.out_combo.currentIndex()
+        return self._id_by_index[i] if 0 <= i < len(self._id_by_index) else -1
+
+    def _on_preview(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        path = item.text()
+        out_id = self._current_out_id()
+        # 既存プレビューを止める
+        if self._preview_th and self._preview_th.isRunning():
+            self._preview_th.stop(); self._preview_th.wait(300)
+        # 新規プレビュー
+        if not self._midi_inited:
+            try:
+                pygame.midi.init()
+                self._midi_inited = True
+            except Exception:
+                pass
+        self._preview_th = _PreviewThread(path, out_id, seconds=8, parent=self)
+        self._preview_th.finished_once.connect(lambda: None)
+        self._preview_th.start()
+
+    def _on_ok(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        self.selected_path = item.text()
+        self.selected_diff = self.diff.currentText()
+        self.selected_out_id = self._current_out_id()
+        # プレビュー止めて閉じる
+        if self._preview_th and self._preview_th.isRunning():
+            self._preview_th.stop(); self._preview_th.wait(300)
+        self.accept()
+        self._cleanup_midi()
+        self.accept()
+ 
+    def _cleanup_midi(self):
+        try:
+            if self._preview_th and self._preview_th.isRunning():
+                self._preview_th.stop(); self._preview_th.wait(300)
+        except Exception:
+            pass
+        try:
+            if self._midi_inited:
+                pygame.midi.quit()
+                self._midi_inited = False
+        except Exception:
+            pass
+
+    def closeEvent(self, e):
+        try:
+            if self._preview_th and self._preview_th.isRunning():
+                self._preview_th.stop(); self._preview_th.wait(300)
+        except Exception:
+            pass
+        self._cleanup_midi()
+        super().closeEvent(e)
+
+
+
 class FinishBreakWindow(QWidget):
     def __init__(self, title, on_confirm, screen=None, parent=None):
         super().__init__(parent)
@@ -357,6 +717,8 @@ class PomodoroGameLauncher(QWidget):
                 # 追加：初回の時間を保持
         self.initial_work_duration = None
         self.initial_rest_duration = None
+        self._work_ended_at = None   # 作業タイマーが0になった時刻
+        self._rest_ended_at = None   # 休憩タイマーが0になった時刻
         self.session_round = 0  # 何回目のセッションか
         self.preview=PreviewController(parent=self)
         
@@ -386,14 +748,27 @@ class PomodoroGameLauncher(QWidget):
             self.preview.stop_whiteout_others()
             self.preview.stop()
     # PomodoroGameLauncher 内（メソッドのどこかに追加）
+    
+
+
 
     def _confirm_stop_runner(self, kind: str):
+            # --- 追加：休憩終了ボタンが押されるまでの超過休憩時間を表示 ---
+        if self._rest_ended_at is not None:
+            overrun_rest = time.time() - self._rest_ended_at
+            print(f"[Overrun] 休憩超過時間: {format_mmss(overrun_rest)}")
+            self._rest_ended_at = None
+
         """FinishBreakWindow のボタンで呼ばれる停止実行ヘルパ"""
         try:
             if kind == "script":
                 self.stop_script()   # 既存：通知→restart_cycle までやる
             elif kind == "exe":
                 self.stop_exe()      # 既存：通知→restart_cycle までやる
+            # _confirm_stop_runner() 内の分岐に追加
+            elif kind == "white":
+                self.stop_white_only()
+
         except Exception:
             pass
 
@@ -533,6 +908,10 @@ class PomodoroGameLauncher(QWidget):
             screen=scr,
             input_through=True
         )
+            # ★ 追加：フェード開始直後にタイマーを“二段”で最前へ押し上げ
+        if getattr(self, "timer_win", None):
+            QTimer.singleShot(0,  lambda: bring_front_noactivate(self.timer_win))
+            QTimer.singleShot(80, lambda: bring_front_noactivate(self.timer_win))
 
 
 
@@ -597,10 +976,14 @@ class PomodoroGameLauncher(QWidget):
         if not finish_cb:
             self._cancel_to_home(); return
 
-        self.timer_win = TimerWindow(self.work_duration, finish_cb)
+        self.timer_win = TimerWindow(self.work_duration, lambda: self._on_work_timer_finish(finish_cb))
         self.timer_win.show()
         self.hide()
-        
+    def _on_work_timer_finish(self, cb):
+        # 作業タイマーが0になった瞬間の時刻を記録
+        self._work_ended_at = time.time()
+        cb()  # 既存の後続処理（曲選択UIや break ボタン表示など）
+
     # 追加：デモ用に .mid / .midi を自動選曲
     def _find_demo_midi(self):
         # 1) 環境変数が指定されていたら最優先
@@ -637,28 +1020,33 @@ class PomodoroGameLauncher(QWidget):
         # mode, ok_mode = QInputDialog.getItem(... を置き換え）
         mode, ok_mode = self._big_get_item(
             "モード選択", "休憩後に何をしたい？",
-            ["音楽ゲーム", "テトリス", "スクリプト実行", "EXE実行"], 0, False
+            ["音楽ゲーム", "テトリス", "スクリプト実行", "EXE実行","ホワイトアウト"], 0, False
         )
         if not ok_mode: return None
         self.mode = mode
 
 
         if self.mode == "音楽ゲーム":
-            auto = self._find_demo_midi()
-            if auto:
-                self.midi_path = auto
-                print(f"{self.midi_path}")
-                return self.start_game_preview
-            
-            dlg = QFileDialog(self, "MIDIファイルを選択")
-            dlg.setNameFilter("MIDI Files (*.mid *.midi)")
-            dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
-            if dlg.exec_():
-                files = dlg.selectedFiles()
-                if not files: return None
-                self.midi_path = files[0]
-            else:
+            # 曲選択ダイアログを開く
+            import os
+            seed = [
+                os.path.join(os.path.dirname(__file__), "music"),
+                os.path.join(os.getcwd(), "music")
+            ]
+            dlg = SimpleSongSelectDialog(
+                    parent=self,
+                    seed_dirs=seed,
+                    list_midi_output_devices_func=list_midi_output_devices,
+                    pick_default_midi_out_id_func=pick_default_midi_out_id
+            )
+            if dlg.exec_() != QDialog.Accepted:
                 return None
+            if not dlg.selected_path:
+                return None
+
+            self.midi_path = dlg.selected_path
+            self.difficulty = dlg.selected_diff  # ← 取得
+            self.midi_out_id = dlg.selected_out_id  # ← 追加保持
             return self.start_game_preview
 
         elif self.mode == "テトリス":
@@ -674,7 +1062,9 @@ class PomodoroGameLauncher(QWidget):
                 self.script_path = files[0]
             else:
                 return None
-            return self.start_script
+            return self.prepare_runner_break 
+        elif self.mode == "ホワイトアウト":
+            return self.prepare_white_only
 
         else:  # EXE実行
             dlg = QFileDialog(self, "実行する EXEファイルを選択")
@@ -686,7 +1076,9 @@ class PomodoroGameLauncher(QWidget):
                 self.exe_path = files[0]
             else:
                 return None
-            return self.start_exe
+            return self.prepare_runner_break 
+            # _choose_mode_and_target() の分岐に追加
+
         
         # PomodoroGameLauncher 内
     def _really_quit(self):
@@ -711,6 +1103,24 @@ class PomodoroGameLauncher(QWidget):
 
         # アプリを終了
         QApplication.instance().quit()
+
+    def prepare_runner_break(self):
+        # 念のため既存のプレビュー/白オーバーレイ/ゲーム窓は閉じる
+        try:
+            self.preview.stop_whiteout_others()
+        except Exception:
+            pass
+        self._close_game_windows()
+
+        scr = self._target_screen()
+        self.break_button_win = BreakButtonWindow(
+            self.start_break_timer,      # 押されたら休憩開始へ
+            on_manual_close=self._really_quit,
+            screen=scr,
+            parent=self
+        )
+        self.break_button_win.show()
+        self.break_button_win.raise_()
 
         
     def _prompt_next_session(self):
@@ -741,6 +1151,25 @@ class PomodoroGameLauncher(QWidget):
         else:
             # 時間を再入力（最初から）
             self.setup_session()
+    # PomodoroGameLauncher 内に追加
+    def prepare_whiteout_break(self):
+        # 念のため既存のプレビュー/白オーバーレイ/ゲーム窓は閉じる
+        try:
+            self.preview.stop_whiteout_others()
+        except Exception:
+            pass
+        self._close_game_windows()
+
+        scr = self._target_screen()
+        self.break_button_win = BreakButtonWindow(
+            self.start_white_only,           # 押されたら白画面ON→タイマー開始
+            on_manual_close=self._really_quit,
+            screen=scr,
+            parent=self
+        )
+        self.break_button_win.show()
+        self.break_button_win.raise_()
+
 
 
 
@@ -751,13 +1180,32 @@ class PomodoroGameLauncher(QWidget):
 
     def start_game_preview(self):
         self._close_game_windows()
+        try:
+            pygame.midi.quit()
+        except Exception:
+            pass
+        out_id = getattr(self, "midi_out_id", pick_default_midi_out_id())
         # ここを preview_mode=False に
-        self.game_window = MidiGame(self.midi_path, preview_mode=False)
+        self.game_window = MidiGame(self.midi_path, preview_mode=False,difficulty=getattr(self,"difficulty","Normal"), midi_out_id=out_id)
         # self.game_window.showFullScreen()
+            # MidiGame のシグネチャに合わせて安全に渡す
+        diff = getattr(self, "difficulty", "Normal")
+        try:
+            self.game_window = MidiGame(self.midi_path,
+                                    preview_mode=False,
+                                    difficulty=diff,
+                                    midi_out_id=out_id)
+        except TypeError:
+        # 古い MidiGame で引数が無い場合
+            self.game_window = MidiGame(self.midi_path, preview_mode=False)
         
         scr = self._target_screen()  # ★ ランチャーのいる画面
         # プレビュー（全画面・フェード）
         self.preview.start(self.game_window, fullscreen=True,screen=scr)
+            # ★ プレビュー窓を出した“後”に、タイマーをもう一度前面へ
+        QTimer.singleShot(50, lambda: getattr(self, "timer_win", None) and bring_front_noactivate(self.timer_win))
+        for delay in (50, 250):
+            QTimer.singleShot(delay, lambda: getattr(self, "timer_win", None) and bring_front_noactivate(self.timer_win))
     # ★ ゲーム以外のすべての画面を白でフェード
         self.preview.start_whiteout_others(self.game_window,  host_screen=scr,include_host=False,)
         scr = self._target_screen()
@@ -770,6 +1218,7 @@ class PomodoroGameLauncher(QWidget):
         )
         self.break_button_win.show()
         self.break_button_win.raise_()    # タイマーを前面へ
+        
 
         
     def start_tetris(self):
@@ -780,6 +1229,8 @@ class PomodoroGameLauncher(QWidget):
         scr = self._target_screen()  # ★ ランチャーのいる画面
         # プレビュー（全画面・フェード）
         self.preview.start(self.tetris_window, fullscreen=True,screen=scr)
+            # ★ プレビュー窓を出した“後”に、タイマーをもう一度前面へ
+        QTimer.singleShot(50, lambda: getattr(self, "timer_win", None) and bring_front_noactivate(self.timer_win))
         # ★ ゲーム以外のすべての画面を白でフェード
         self.preview.start_whiteout_others(self.tetris_window,  host_screen=scr,include_host=False,)
         scr = self._target_screen()
@@ -792,6 +1243,102 @@ class PomodoroGameLauncher(QWidget):
         )
         self.break_button_win.show()
         self.break_button_win.raise_()
+    # PomodoroGameLauncher 内に追加
+    def start_white_only(self):
+        # まず休憩開始ボタンを閉じる
+        try:
+            if hasattr(self, 'break_button_win') and self.break_button_win:
+                self.break_button_win.close()
+        except Exception:
+            pass
+
+        # ホスト（今いる画面）を真っ白で覆う
+        scr = self._target_screen()
+        self.white_cover = WhiteCoverWindow(screen=scr, parent=self)
+        self.white_cover.show_cover()
+
+        # 他モニタも白で覆う（既存のホワイトアウト機構を流用）
+        # host_widget=white_cover / include_host=False で、他モニタのみ白100%
+        self.preview.start_whiteout_others(
+            host_widget=self.white_cover,
+            host_screen=scr,
+            include_host=False,         # ホストは self.white_cover が覆う
+            start_opacity=1.0,
+            end_opacity=1.0,
+            duration_ms=1,
+            interval_ms=50
+        )
+
+        # タイマー開始（通常と同じ）
+        self.timer_win = TimerWindow(
+            self.rest_duration,
+            self.on_break_end,          # 0になったら「休憩終了」ボタンを出す分岐へ
+            screen=scr,
+            one_minute_cb=self._start_return_to_work_fade  # ※不要なら外してOK（白画面には効かない）
+        )
+        self.timer_win.show()
+        QTimer.singleShot(0, lambda: bring_front_noactivate(self.timer_win))
+        self.timer_win.raise_()
+    def prepare_white_only(self):
+        """ゲーム無しの白カバー専用モード：まずは『休憩を開始する』ボタンだけ出す"""
+        try:
+            self.preview.stop_whiteout_others()
+        except Exception:
+            pass
+        self._close_game_windows()
+
+        scr = self._target_screen()
+        self.break_button_win = BreakButtonWindow(
+            self.start_white_session,         # ← 押されたら白カバー＋休憩タイマー開始
+            on_manual_close=self._really_quit,
+            screen=scr,
+            parent=self
+        )
+        self.break_button_win.show()
+        self.break_button_win.raise_()
+    def start_white_session(self):
+        """休憩ボタンが押された後：作業超過のprint→白カバー表示→休憩タイマー開始"""
+        # 作業超過時間のprint（mm:ss）
+        if self._work_ended_at is not None:
+            overrun_work = time.time() - self._work_ended_at
+            print(f"[Overrun] 作業超過時間: {format_mmss(overrun_work)}")
+            self._work_ended_at = None
+
+        # 既存の白オーバーレイを消しておく
+        try:
+            self.preview.stop_whiteout_others()
+        except Exception:
+            pass
+
+        # 画面を真っ白で覆う（クラス不要のインライン実装）
+        scr = self._target_screen()
+        self.white_cover = QWidget(
+            None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.white_cover.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.white_cover.setFocusPolicy(Qt.NoFocus)
+        self.white_cover.setStyleSheet("background:#ffffff;")
+        g = scr.geometry()
+        self.white_cover.setGeometry(g)
+        self.white_cover.showFullScreen()
+        self.white_cover.raise_()
+        win_force_topmost(self.white_cover, True)
+            # ★ ここを追加：他モニターも一発で白！(100%・即時)
+        self.preview.start_whiteout_others(
+            host_widget=self.white_cover,   # これ基準で“他の画面”を判定
+            host_screen=scr,
+            include_host=False,
+            start_opacity=1.0,
+            end_opacity=1.0,
+            duration_ms=1,
+            interval_ms=50
+        )
+
+        # 休憩タイマー（終了時 on_break_end → 確認ダイアログへ）
+        self.timer_win = TimerWindow(self.rest_duration, self.on_break_end, screen=scr)
+        self.timer_win.show()
+        QTimer.singleShot(0, lambda: bring_front_noactivate(self.timer_win))
+
 
 
     # start_break_timer の中では既存の enable_interaction を呼んでいるので
@@ -799,8 +1346,45 @@ class PomodoroGameLauncher(QWidget):
 
 
     def start_break_timer(self):
+        if self._work_ended_at is not None:
+            overrun_work = time.time() - self._work_ended_at
+            print(f"[Overrun] 作業超過時間: {format_mmss(overrun_work)}")
+            self._work_ended_at = None
+        if getattr(self, 'mode', '') in ('スクリプト実行', 'EXE実行'):
+            # 先に休憩ボタンを閉じる
+            try:
+                if hasattr(self, 'break_button_win') and self.break_button_win:
+                    self.break_button_win.close()
+            except Exception:
+                pass
+            # プロセスを起動
+            try:
+                if self.mode == 'スクリプト実行':
+                    self.proc = subprocess.Popen([sys.executable, self.script_path])
+                else:
+                    self.proc = subprocess.Popen([self.exe_path])
+            except Exception as e:
+                # エラー通知して次のセッション選択へ
+                notice = QLabel(f"起動に失敗しました: {e}")
+                notice.setWindowFlags(Qt.WindowStaysOnTopHint)
+                notice.setAlignment(Qt.AlignCenter)
+                notice.setStyleSheet("font-size:18px;padding:10px;")
+                notice.show()
+                QTimer.singleShot(2500, notice.close)
+                self._prompt_next_session()
+                return
+
+            # タイマー開始（白オーバーレイやプレビューは無し）
+            scr = self._target_screen()
+            self.timer_win = TimerWindow(self.rest_duration, self.on_break_end, screen=scr)
+            self.timer_win.show()
+            self.timer_win.raise_()
+            return
         # プレビュー終了→操作可へ
         self.preview.finalize()
+        # ★ finalize が内部でゲームをTopMostにした直後に、タイマーを先に確保
+        # （あとで self.timer_win を作るので、その直後にももう一度押し上げる）
+        QTimer.singleShot(0, lambda: getattr(self, "timer_win", None) and bring_front_noactivate(self.timer_win))
         scr = self._target_screen()  # ★ ランチャーのいる画
             # 既存の白オーバーレイがあれば一旦消す
         try:
@@ -810,11 +1394,16 @@ class PomodoroGameLauncher(QWidget):
 
         gw = getattr(self, 'game_window', None)
         if gw is not None:
+            try:
+                win_force_topmost(gw, False)
+            except Exception:
+                pass
             # ゲーム側はフォーカス確保など最小限
             try:
                 gw.enable_interaction()
             except Exception:
                 pass
+            focus_window_soft(gw)
 
         tw = getattr(self, 'tetris_window', None)
         if tw is not None:
@@ -822,6 +1411,7 @@ class PomodoroGameLauncher(QWidget):
                 tw.enable_interaction()
             except Exception:
                 pass
+            focus_window_soft(gw)
             
             # どのウィンドウをホストにするか（音ゲー優先、なければテトリス）
         host = getattr(self, 'game_window', None) or getattr(self, 'tetris_window', None)
@@ -843,10 +1433,14 @@ class PomodoroGameLauncher(QWidget):
         screen=scr,
         one_minute_cb=self._start_return_to_work_fade)
         self.timer_win.show()
+        QTimer.singleShot(0, lambda: bring_front_noactivate(self.timer_win))
+        QTimer.singleShot(80, lambda: bring_front_noactivate(self.timer_win))
         self.timer_win.raise_()  # 常に最前面
 
 
     def on_break_end(self):
+            # 休憩タイマーが0になった時刻を記録
+        self._rest_ended_at = time.time()
         # 他画面白オーバーレイを消す（既存）
         try:
             self.preview.stop_whiteout_others()
@@ -887,9 +1481,50 @@ class PomodoroGameLauncher(QWidget):
             )
             self.finish_break_win.show()
             return
+        # on_break_end() のモード分岐に追加
+        # ★ ホワイトアウトのみ：終了確認ダイアログを出す
+        if getattr(self, "mode", "") == "ホワイトアウト" and hasattr(self, "white_cover") and self.white_cover:
+            self.finish_break_win = FinishBreakWindow(
+                "休憩終了",
+                on_confirm=lambda: self._confirm_stop_runner("white"),
+                screen=scr,
+                parent=self
+            )
+            self.finish_break_win.show()
+            return
+
 
         # ★ それ以外（音ゲー/テトリス等）は従来どおり次の動きへ
         self._prompt_next_session()
+        
+        
+    # PomodoroGameLauncher 内に追加
+    def stop_white_only(self):
+        # 他モニタの白オーバーレイ解除
+        try:
+            self.preview.stop_whiteout_others()
+        except Exception:
+            pass
+        # ホストの白カバー閉じる
+        try:
+            if hasattr(self, 'white_cover') and self.white_cover:
+                self.white_cover.close()
+        except Exception:
+            pass
+        self.white_cover = None
+        self.restart_cycle()
+
+        # 完了通知（任意）
+        notice = QLabel("休憩終了！白画面を閉じました。")
+        notice.setWindowFlags(Qt.WindowStaysOnTopHint)
+        notice.setAlignment(Qt.AlignCenter)
+        notice.setStyleSheet("font-size:18px;padding:10px;")
+        notice.show()
+        QTimer.singleShot(1500, notice.close)
+
+        # 次のセッションへ
+        self.restart_cycle()
+
 
 
 
@@ -966,10 +1601,10 @@ class TimerWindow(QWidget):
     def initUI(self):
         # TimerWindow.__init__ の initUI でフラグをこれに
         self.setWindowFlags(
-            Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
+            Qt.WindowStaysOnTopHint| Qt.WindowTitleHint | Qt.WindowCloseButtonHint
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)  # 表示してもフォーカスは奪わない
-        
+        self.setFocusPolicy(Qt.NoFocus)
         
         # ★ 指定スクリーンの右上
         scr = self._screen or (self.parent().windowHandle().screen() if self.parent() and self.parent().windowHandle() else None)
@@ -996,13 +1631,13 @@ class TimerWindow(QWidget):
         self.timer.start(1000)
         # TimerWindow クラスに追記（フォーカスを奪わず最前面へ“押し上げ”）
          # ★ 常時“最前面に押し上げ”キープ（0.8秒おき）
-        self._ontop_timer = QTimer(self)
-        self._ontop_timer.setTimerType(Qt.VeryCoarseTimer)
-        self._ontop_timer.timeout.connect(self._bump_on_top)
-        self._ontop_timer.start(800)
+        # self._ontop_timer = QTimer(self)
+        # self._ontop_timer.setTimerType(Qt.VeryCoarseTimer)
+        # self._ontop_timer.timeout.connect(self._bump_on_top)
+        # self._ontop_timer.start(800)
     def showEvent(self, e):
         super().showEvent(e)
-        self._bump_on_top()
+        bring_front_noactivate(self) 
 
     def _bump_on_top(self):
         if not self.isVisible():
@@ -1037,9 +1672,9 @@ class TimerWindow(QWidget):
         self.label.setText(f"{minutes:02}:{seconds:02}")
         
     def closeEvent(self, e):
-        if hasattr(self, "_ontop_timer") and self._ontop_timer:
-            try: self._ontop_timer.stop()
-            except Exception: pass
+        # if hasattr(self, "_ontop_timer") and self._ontop_timer:
+        #     try: self._ontop_timer.stop()
+        #     except Exception: pass
         if not self._closing_programmatically and self.exit_on_manual_close:
             QApplication.quit()
         super().closeEvent(e)
@@ -1069,10 +1704,10 @@ class BreakButtonWindow(QWidget):
         self.move(g.right() - self.width() - 10, g.top() + 10)
         
         # __init__ の keep-alive を置き換え
-        self._ontop_timer = QTimer(self)
-        self._ontop_timer.setTimerType(Qt.VeryCoarseTimer)
-        self._ontop_timer.timeout.connect(lambda: (self.raise_(), win_force_topmost(self, True)))  # ← ここ変更
-        self._ontop_timer.start(800)
+        # self._ontop_timer = QTimer(self)
+        # self._ontop_timer.setTimerType(Qt.VeryCoarseTimer)
+        # self._ontop_timer.timeout.connect(lambda: (self.raise_(), win_force_topmost(self, True)))  # ← ここ変更
+        # self._ontop_timer.start(800)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -1107,9 +1742,9 @@ class BreakButtonWindow(QWidget):
             self.close()
 
     def closeEvent(self, e):
-        if hasattr(self, "_ontop_timer") and self._ontop_timer:
-            try: self._ontop_timer.stop()
-            except Exception: pass
+        # if hasattr(self, "_ontop_timer") and self._ontop_timer:
+        #     try: self._ontop_timer.stop()
+        #     except Exception: pass
         if (e.spontaneous() and not self._closed_by_button):
             if callable(self.on_manual_close):
                 self.on_manual_close()

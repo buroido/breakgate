@@ -4,6 +4,7 @@ import random
 import threading
 import os
 from collections import defaultdict
+from midi_utils import list_midi_output_devices, pick_default_midi_out_id, open_output_or_none
 
 import mido
 import pygame
@@ -15,6 +16,40 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QBrush, QColor, QFont, QPen
+# qt_midi_game.py
+try:
+    from midi_utils import pick_default_midi_out_id, open_output_or_none
+except ImportError:
+    import pygame.midi
+    def _safe_midi_init():
+        if not pygame.midi.get_init():
+            pygame.midi.init()
+    def pick_default_midi_out_id(prefer_names=("Microsoft GS Wavetable","MIDI","Synth")):
+        _safe_midi_init()
+        n = pygame.midi.get_count()
+        outs = []
+        for i in range(n):
+            info = pygame.midi.get_device_info(i)
+            if info and info[3]:  # is_output
+                outs.append((i, info[1].decode(errors="ignore")))
+        if not outs: return -1
+        for pid, pname in outs:
+            if any(s.lower() in pname.lower() for s in prefer_names):
+                return pid
+        return outs[0][0]
+    def open_output_or_none(device_id=None):
+        _safe_midi_init()
+        try:
+            if device_id is None or device_id == -1:
+                device_id = pick_default_midi_out_id()
+                if device_id == -1:
+                    device_id = pygame.midi.get_default_output_id()
+            if device_id is None or device_id == -1:
+                return None
+            return pygame.midi.Output(device_id)
+        except Exception:
+            return None
+
 
 # ====== デバッグ用：テストMIDI固定パス ======
 TEST_MIDI_PATH = r"C:\Users\tubasa usami\pythoncode\pomodoro\music\45秒で何ができる.mid"
@@ -61,7 +96,7 @@ class NoteItem(QGraphicsRectItem):
 from PyQt5.QtGui import QBrush, QColor, QFont, QPen, QPainter
 
 class MidiGame(QWidget):
-    def __init__(self, midi_path, preview_mode=False, difficulty="Normal"):
+    def __init__(self, midi_path, preview_mode=False, difficulty="Normal",midi_out_id=None):
         super().__init__()
         self.setWindowTitle("PyQt MIDI Game")
 
@@ -133,8 +168,16 @@ class MidiGame(QWidget):
         self.midi_out = None
         try:
             pygame.midi.init()
-            default_id = pygame.midi.get_default_output_id()
-            self.midi_out = pygame.midi.Output(default_id) if default_id != -1 else None
+            # 指定があればそれを使う、なければ優先名で決め打ち
+            if midi_out_id is None:
+                midi_out_id = pick_default_midi_out_id()
+            if midi_out_id != -1:
+                self.midi_out = pygame.midi.Output(midi_out_id)
+            else:
+                # 最後の保険：pygameのデフォルト（-1の場合多い）
+                default_id = pygame.midi.get_default_output_id()
+                if default_id != -1:
+                    self.midi_out = pygame.midi.Output(default_id)
         except Exception:
             self.midi_out = None
 
@@ -144,7 +187,7 @@ class MidiGame(QWidget):
             self.setWindowFlags(flags)
             self.setWindowOpacity(0.5)
         else:
-            self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+            self.setWindowFlags( Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
 
         # ゲームループ
         self.start_time = time.time()
@@ -161,18 +204,39 @@ class MidiGame(QWidget):
         # ゲームクラス内（__init__の下あたり）に追加
     
     def set_click_through(self, on: bool):
-        """プレビュー用：クリック透過の切替（TopMostは維持）"""
+        """プレビュー用クリック透過 ON/OFF（OFF時は“ふつうのウィンドウ”に戻す）"""
+        # まず属性
         self.setAttribute(Qt.WA_TransparentForMouseEvents, on)
+
         f = self.windowFlags()
         if on:
+            # 透過プレビュー：クリックは素通り・枠なし・最前面・Tool化
             f |= Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint | Qt.Tool
+            self.setWindowFlags(f)
+            self.setWindowOpacity(0.5)
+            self.show()  # 反映
+            _win_force_topmost(self, True)
         else:
+            # ★OFF：ぜんぶ剥がす（ここが重要）
             f &= ~Qt.WindowTransparentForInput
             f &= ~Qt.FramelessWindowHint
-            f |= Qt.WindowStaysOnTopHint  # 解除後もTopMost維持
-        self.setWindowFlags(f)
-        self.show()               # フラグ反映
-        _win_force_topmost(self, True)
+            f &= ~Qt.WindowStaysOnTopHint
+            f &= ~Qt.Tool
+            f |= Qt.Window
+            self.setWindowFlags(f)
+
+            # 透過・非アクティブ系の属性も解除
+            self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self.setWindowOpacity(1.0)
+
+            # “普通のフルスクリーン Window”として出し直し → フォーカス確保
+            self.showFullScreen()
+            self.setFocusPolicy(Qt.StrongFocus)
+            self.activateWindow()
+            self.setFocus(Qt.ActiveWindowFocusReason)
+            # ここでは *_win_force_topmost は呼ばない（最前面維持はタイマー側が担当）
+
         
     # ここ“だけ”をフィット対象にする（周りは白余白）
     def _fit_view(self):
@@ -188,14 +252,8 @@ class MidiGame(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
-        # 表示直後に念押しで最前面へ
-        QTimer.singleShot(0, lambda: (_win_force_topmost(self, True), self.raise_()))
-        # 周期的に最前面へ（QGraphicsViewの再作成対策）
-        if not hasattr(self, "_ontop_timer"):
-            self._ontop_timer = QTimer(self)
-            self._ontop_timer.setTimerType(Qt.VeryCoarseTimer)
-            self._ontop_timer.timeout.connect(lambda: (_win_force_topmost(self, True), self.raise_()))
-            self._ontop_timer.start(700)  # テトリスより少し短い周期で上書き勝ち
+        # ここでは何もしない（TopMost維持はプレビュー中のみ、操作解禁後は不要）
+
 
 
 
@@ -346,22 +404,28 @@ class MidiGame(QWidget):
 
     # ====== プレビュー解除（フォーカス確保含む） ======
     def enable_interaction(self):
-        # self.preview_mode = False
-        # self.setWindowFlags( Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        # self.setWindowOpacity(1.0)
-        # self.showFullScreen()      # ★ フルスクリーン維持
+        # 念のためプレビュー痕跡を完全解除
+        self.set_click_through(False)
+
+        # レイアウト反映
         QTimer.singleShot(0, self._fit_view)
-        self._focus_game_window()
+
+        # フォーカス取り切る
+        self.view.clearFocus()
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.activateWindow()
+        self.setFocus(Qt.ActiveWindowFocusReason)
+
         
 
 
     def _focus_game_window(self):
         self.view.clearFocus()
-        self.raise_()
+        #self.raise_()
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
-        QTimer.singleShot(0,   lambda: (self.raise_(), self.activateWindow(), self.setFocus(Qt.ActiveWindowFocusReason)))
-        QTimer.singleShot(120, lambda: (self.raise_(), self.activateWindow(), self.setFocus(Qt.ActiveWindowFocusReason)))
+        #QTimer.singleShot(0,   lambda: (self.raise_(), self.activateWindow(), self.setFocus(Qt.ActiveWindowFocusReason)))
+        #QTimer.singleShot(120, lambda: (self.raise_(), self.activateWindow(), self.setFocus(Qt.ActiveWindowFocusReason)))
 
     # ====== 終了処理（pygame.midiのガード含む） ======
     def closeEvent(self, e):
