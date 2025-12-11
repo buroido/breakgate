@@ -27,6 +27,15 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 import pygame.midi
 import platform
 import shutil
+# --- mac の .app を正規化するヘルパー ---
+def normalize_to_app_bundle(path: str) -> str:
+    p = path
+    while p and not p.lower().endswith(".app"):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p if p and p.lower().endswith(".app") else path
 
 def is_macos():
     return sys.platform == "darwin"
@@ -901,6 +910,34 @@ class PomodoroGameLauncher(QWidget):
             notice.close()
             self.restart_cycle()
         QTimer.singleShot(2000, finish_notice)
+        
+    def _select_app_or_exe(self):
+        """
+        mac: .app（バンドル）を選ぶ。Windows: .exe を選ぶ。
+        戻り値: 選択されたパス or None
+        """
+        from PyQt5.QtWidgets import QFileDialog
+        if sys.platform == "darwin":
+            dlg = QFileDialog(self, "起動するアプリを選択")
+            dlg.setDirectory("/Applications")
+            dlg.setFileMode(QFileDialog.ExistingFile)       # .app を「ファイル」として選択
+            dlg.setNameFilter("Applications (*.app)")
+            dlg.setOption(QFileDialog.DontUseNativeDialog, False)
+            if dlg.exec_():
+                files = dlg.selectedFiles()
+                if files:
+                    return normalize_to_app_bundle(files[0])
+            return None
+        else:
+            dlg = QFileDialog(self, "実行する EXEファイルを選択")
+            dlg.setNameFilter("Executable Files (*.exe)")
+            dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+            if dlg.exec_():
+                files = dlg.selectedFiles()
+                if files:
+                    return files[0]
+            return None
+
 
 
 
@@ -1199,24 +1236,17 @@ class PomodoroGameLauncher(QWidget):
             return self.prepare_white_only
 
         elif self.mode == "アプリ/EXE実行":
-            dlg = QFileDialog(self, "起動するアプリ（Windows: EXE / macOS: .app）を選択")
-            if is_windows():
-                dlg.setNameFilter("Executable Files (*.exe)")
-            elif is_macos():
-                dlg.setNameFilter("Applications (*.app)")
-            else:
-                dlg.setNameFilter("All Files (*)")
-            dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
-            if dlg.exec_():
-                files = dlg.selectedFiles()
-                if not files: return None
-                self.run_target_path = files[0]
-                # プラットフォーム別の種別を覚える（終了時に使う）
-                self.run_target_kind = "win_exe" if is_windows() else ("mac_app" if is_macos() else "generic")
-            else:
+            chosen = self._select_app_or_exe()
+            if not chosen:
                 return None
+            # プラットフォーム別に保存するフィールドを分ける（後段の起動で使う）
+            if sys.platform == "darwin":
+                self.app_path = chosen
+                self.exe_path = None
+            else:
+                self.exe_path = chosen
+                self.app_path = None
             return self.prepare_runner_break
-
         
         # PomodoroGameLauncher 内
     def _really_quit(self):
@@ -1488,15 +1518,25 @@ class PomodoroGameLauncher(QWidget):
             overrun_work = time.time() - self._work_ended_at
             print(f"[Overrun] 作業超過時間: {format_mmss(overrun_work)}")
             self._work_ended_at = None
-        if getattr(self, 'mode', '') == 'スクリプト実行':
+        if getattr(self, 'mode', '') in ('スクリプト実行', 'アプリ/EXE実行'):
+            # 先に休憩ボタンを閉じる
             try:
                 if hasattr(self, 'break_button_win') and self.break_button_win:
                     self.break_button_win.close()
             except Exception:
                 pass
+
+            # 起動
             try:
-                self.proc = subprocess.Popen([sys.executable, self.script_path])
-                self._runinfo = {"method": "script", "proc": self.proc, "app_name": None}
+                if self.mode == 'スクリプト実行':
+                    self.proc = subprocess.Popen([sys.executable, self.script_path])
+                else:
+                    # アプリ/EXE 実行
+                    if sys.platform == "darwin":
+                        # mac は open で .app を起動
+                        self.proc = subprocess.Popen(["open", self.app_path])
+                    else:
+                        self.proc = subprocess.Popen([self.exe_path])
             except Exception as e:
                 notice = QLabel(f"起動に失敗しました: {e}")
                 notice.setWindowFlags(Qt.WindowStaysOnTopHint)
@@ -1507,35 +1547,13 @@ class PomodoroGameLauncher(QWidget):
                 self._prompt_next_session()
                 return
 
+            # タイマー開始（従来どおり）
             scr = self._target_screen()
             self.timer_win = TimerWindow(self.rest_duration, self.on_break_end, screen=scr)
             self.timer_win.show()
             self.timer_win.raise_()
             return
 
-        if getattr(self, 'mode', '') == 'アプリ/EXE実行':
-            try:
-                if hasattr(self, 'break_button_win') and self.break_button_win:
-                    self.break_button_win.close()
-            except Exception:
-                pass
-            try:
-                self._runinfo = launch_external(self.run_target_path)
-            except Exception as e:
-                notice = QLabel(f"起動に失敗しました: {e}")
-                notice.setWindowFlags(Qt.WindowStaysOnTopHint)
-                notice.setAlignment(Qt.AlignCenter)
-                notice.setStyleSheet("font-size:18px;padding:10px;")
-                notice.show()
-                QTimer.singleShot(2500, notice.close)
-                self._prompt_next_session()
-                return
-
-            scr = self._target_screen()
-            self.timer_win = TimerWindow(self.rest_duration, self.on_break_end, screen=scr)
-            self.timer_win.show()
-            self.timer_win.raise_()
-            return
 
         # プレビュー終了→操作可へ
         self.preview.finalize()
@@ -1626,10 +1644,11 @@ class PomodoroGameLauncher(QWidget):
             return
 
         # アプリ/EXE 実行 → 「休憩終了」ボタンで止める（OS別に中身で処理）
-        if getattr(self, "mode", "") == "アプリ/EXE実行" and getattr(self, "_runinfo", None):
+        
+        if getattr(self, "mode", "") == "アプリ/EXE実行" and getattr(self, "proc", None):
             self.finish_break_win = FinishBreakWindow(
                 "休憩終了",
-                on_confirm=lambda: self._confirm_stop_runner("app_or_exe"),
+                on_confirm=lambda: self._confirm_stop_runner("exe"),  # 既存 stop_exe を使う
                 screen=scr,
                 parent=self
             )
@@ -1720,15 +1739,31 @@ class PomodoroGameLauncher(QWidget):
         self.timer_win.show()
 
     def stop_exe(self):
-        """休憩終了後に呼ばれる：起動中の EXE を停止"""
-        if hasattr(self, 'proc'):
-            self.proc.terminate()
+        """休憩終了後に呼ばれる：起動中の EXE（Windows）または App（mac）を停止"""
+        # まず起動プロセス(open や exe)を止める
+        if hasattr(self, 'proc') and self.proc:
             try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        # 完了通知とセッション再スタート
-        notice = QLabel("休憩終了！EXEを停止しました。")
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try: self.proc.kill()
+                except Exception: pass
+
+        # mac: 実アプリを終了させる（AppName.app -> "AppName" を quit）
+        if sys.platform == "darwin" and getattr(self, "app_path", None):
+            app_name = os.path.basename(self.app_path)
+            if app_name.lower().endswith(".app"):
+                app_name = app_name[:-4]
+            try:
+                subprocess.run(
+                    ["osascript", "-e", f'tell application "{app_name}" to quit'],
+                    check=False
+                )
+            except Exception:
+                pass
+
+        # 完了通知とセッション再スタート（従来どおり）
+        notice = QLabel("休憩終了！アプリ/EXEを停止しました。")
         notice.setWindowFlags(Qt.WindowStaysOnTopHint)
         notice.setAlignment(Qt.AlignCenter)
         notice.setStyleSheet("font-size:18px;padding:10px;")
@@ -1737,6 +1772,7 @@ class PomodoroGameLauncher(QWidget):
             notice.close()
             self.restart_cycle()
         QTimer.singleShot(3000, finish_notice)
+
 
 class TimerWindow(QWidget):
     def __init__(self, duration, on_finish=None,exit_on_manual_close=True,screen=None,parent=None,one_minute_cb=None):
