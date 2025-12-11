@@ -1,5 +1,3 @@
-#test
-
 import sys
 import time
 import threading
@@ -11,6 +9,13 @@ from PyQt5.QtCore import Qt, QTimer,QObject,QEventLoop
 from qt_midi_game import MidiGame
 from midi_utils import list_midi_output_devices, pick_default_midi_out_id, open_output_or_none
 
+# 追加：クロスプラットフォームWindowユーティリティ
+from xplatform_window import (
+    make_click_through,
+    raise_topmost_noactivate,
+    activate_for_input,
+    show_fullscreen_borderless,
+)
 from PyQt5.QtCore import Qt
 from qt_tetris_game import TetrisGame
 from PyQt5.QtGui import QGuiApplication, QCursor
@@ -21,6 +26,12 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 # ===== MIDI 出力ユーティリティ =====
 import pygame.midi
 
+def bring_front_noactivate(widget):
+    raise_topmost_noactivate(widget, True)
+
+def win_force_topmost(widget, on=True):
+    raise_topmost_noactivate(widget, on)
+    
 def focus_window_soft(widget):
     """Qtだけで“できるだけ”アクティブ＆フォーカスを渡す（Z順は変えない）"""
     if not widget: return
@@ -136,14 +147,15 @@ class PreviewController(QObject):
         widget.winId()
 
         # ← ここをゲーム側の共通関数に委譲
-        if input_through and hasattr(widget, "set_click_through"):
-            widget.set_click_through(True)
+        if input_through:
+            make_click_through(widget, True, keep_topmost=True)
         else:
-            # フォールバック（旧処理）
-            widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            # 透過を使わない開始パス
+            widget.setAttribute(Qt.WA_TransparentForMouseEvents, False)
             f = widget.windowFlags()
-            f |= Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint | Qt.Tool
+            f |= Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
             widget.setWindowFlags(f)
+            widget.show()
 
         widget.setWindowOpacity(float(start_opacity))
 
@@ -164,6 +176,8 @@ class PreviewController(QObject):
             hasattr(widget, "set_click_through") and widget.set_click_through(True)
         ))
         QTimer.singleShot(0, lambda: win_force_topmost(widget, True))
+        QTimer.singleShot(0, lambda: raise_topmost_noactivate(widget, True))
+
         
          # ← 追加：ゲーム窓の最前面 Keep-Alive（タイマーより遅く）
         # if self._front_keepalive:
@@ -196,36 +210,45 @@ class PreviewController(QObject):
             return
         w.setWindowOpacity(op)
 
+
+
     def finalize(self):
         if not self._widget:
             return
         self.stop()
         w = self._widget
-        w.setWindowOpacity(1.0)
 
-        # ★ 透過を解除
-        w.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-        flags = w.windowFlags()
-        flags &= ~Qt.WindowTransparentForInput
-        flags &= ~Qt.FramelessWindowHint
-        flags |= Qt.Window
-        w.setWindowFlags(flags)
-        w.showFullScreen()
+        # 透過とTopMost系を完全解除
         try:
-            from qt_midi_game import MidiGame
-            if isinstance(w, MidiGame):
-                w.set_click_through(False)   # 透過解除＋TopMost維持
+            make_click_through(w, False)  # ← WindowTransparentForInput/Tool/Frameless を外す
         except Exception:
             pass
-        #win_force_topmost(w, True)  
-        
+        w.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+        # 念のためウィンドウフラグも明示修正（ToolやTransparentを確実に外す）
+        f = w.windowFlags()
+        f &= ~Qt.WindowTransparentForInput
+        f &= ~Qt.Tool
+        f &= ~Qt.FramelessWindowHint
+        f |= Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
+        w.setWindowFlags(f)
+
+        # 不透明化
+        w.setWindowOpacity(1.0)
+
+        # 独占フルスクリーンは使わず、ボーダレス全画面（または最大化相当）
+        show_fullscreen_borderless(w)
+
+        # 入力フォーカスを確実に取る
+        activate_for_input(w)
+
         self._widget = None
-        #win_force_topmost(w, True)
-        
+
         if self._front_keepalive:
             try: self._front_keepalive.stop()
             except Exception: pass
-        self._front_keepalive = None
+            self._front_keepalive = None
+
 
 
     def stop(self):
@@ -1384,6 +1407,11 @@ class PomodoroGameLauncher(QWidget):
             return
         # プレビュー終了→操作可へ
         self.preview.finalize()
+        
+        host = getattr(self, 'game_window', None) or getattr(self, 'tetris_window', None)
+        if host is not None:
+            activate_for_input(host)
+
         # ★ finalize が内部でゲームをTopMostにした直後に、タイマーを先に確保
         # （あとで self.timer_win を作るので、その直後にももう一度押し上げる）
         QTimer.singleShot(0, lambda: getattr(self, "timer_win", None) and bring_front_noactivate(self.timer_win))
@@ -1760,4 +1788,3 @@ if __name__ == '__main__':
     launcher = PomodoroGameLauncher()
     launcher.show()
     sys.exit(app.exec_())
-

@@ -6,6 +6,12 @@ import os
 from collections import defaultdict
 from midi_utils import list_midi_output_devices, pick_default_midi_out_id, open_output_or_none
 
+from xplatform_window import (
+    activate_for_input,
+    show_fullscreen_borderless,
+    make_click_through,
+)
+
 import mido
 import pygame
 import pygame.midi
@@ -183,11 +189,12 @@ class MidiGame(QWidget):
 
         # プレビュー時のフラグ（以前の通り）
         if preview_mode:
-            flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.WindowTransparentForInput
-            self.setWindowFlags(flags)
-            self.setWindowOpacity(0.5)
+            # 旧：flags 直書き
+            # 新：統一API
+            make_click_through(self, True, keep_topmost=True)
         else:
-            self.setWindowFlags( Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+            # ゲーム本番時はフラグ極力いじらない（TopMostを要求しない）
+            self.setWindowFlags(Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
 
         # ゲームループ
         self.start_time = time.time()
@@ -403,18 +410,23 @@ class MidiGame(QWidget):
         self.floating_texts = alive
 
     # ====== プレビュー解除（フォーカス確保含む） ======
+
+
     def enable_interaction(self):
-        # 念のためプレビュー痕跡を完全解除
-        self.set_click_through(False)
+        # ← ここを先頭に追加（保険）
+        try:
+            make_click_through(self, False)
+        except Exception:
+            pass
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setWindowOpacity(1.0)
 
-        # レイアウト反映
+        # もしプレビューでフラグレス化していても、ここで整える
+        show_fullscreen_borderless(self)
+
         QTimer.singleShot(0, self._fit_view)
+        activate_for_input(self)
 
-        # フォーカス取り切る
-        self.view.clearFocus()
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.activateWindow()
-        self.setFocus(Qt.ActiveWindowFocusReason)
 
         
 
