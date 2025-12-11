@@ -1,3 +1,5 @@
+#test
+
 import sys
 import time
 import threading
@@ -1758,3 +1760,4 @@ if __name__ == '__main__':
     launcher = PomodoroGameLauncher()
     launcher.show()
     sys.exit(app.exec_())
+
