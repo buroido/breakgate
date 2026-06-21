@@ -14,3 +14,6 @@ venv/
 # bin は exe のみ追跡
 /bin/*
 !/bin/PomodoroApp.exe
+
+# 更新用スクリプト（手元用・リポジトリには含めない）
+*.bat
