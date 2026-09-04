@@ -17,3 +17,7 @@ venv/
 
 # 更新用スクリプト（手元用・リポジトリには含めない）
 *.bat
+
+# 楽曲(.mid)は権利の都合でリポジトリに含めない（利用者が各自用意する）
+/source/music/*
+!/source/music/README.md
